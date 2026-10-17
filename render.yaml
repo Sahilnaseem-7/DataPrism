@@ -2,14 +2,10 @@ services:
   - type: web
     name: dataprism
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /api/health
     envVars:
       - key: DATAPRISM_HOST
         value: 0.0.0.0
       - key: DATAPRISM_DB
-        value: /var/data/platform.sqlite3
-    disk:
-      name: dataprism-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: /tmp/dataprism/platform.sqlite3
