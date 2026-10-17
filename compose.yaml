@@ -1,0 +1,15 @@
+services:
+  dataprism:
+    build: .
+    ports:
+      - "8780:8780"
+    environment:
+      PORT: "8780"
+      DATAPRISM_HOST: "0.0.0.0"
+      DATAPRISM_DB: "/app/data/platform.sqlite3"
+    volumes:
+      - margimap-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  margimap-data:
