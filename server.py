@@ -1,236 +1,355 @@
-"""DataPrism local analytics MVP. Binds to loopback only; uploads stay on this machine."""
-from datetime import datetime, date
-from email.parser import BytesParser
-from email.policy import default
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO, StringIO
-from zipfile import ZipFile
-from pathlib import Path
+"""DataPrism Local Web App Server (Single-Workspace E-Commerce Server)."""
+from __future__ import annotations
+
 import csv
+import email.parser
+import email.policy
+import io
 import json
-import mimetypes
+import os
 import re
 import sqlite3
 import sys
-import urllib.parse
-import uuid
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
 
 ROOT = Path(__file__).resolve().parent
-DB = ROOT / "data" / "margimap.sqlite3"
-MAX_UPLOAD = 50 * 1024 * 1024
+DB_PATH = Path(os.environ.get("DATAPRISM_LOCAL_DB", str(ROOT / "data" / "margimap.sqlite3")))
 
 ALIASES = {
-    "date": {"date", "order_date", "created_at", "invoicedate", "invoice_date", "timestamp", "day"},
-    "order": {"order_id", "order", "invoice", "invoiceno", "invoice_no", "order_number", "transaction_id", "name"},
-    "product": {"product", "product_name", "description", "item", "title", "sku", "stockcode", "stock_code"},
-    "channel": {"channel", "source", "sales_channel", "platform", "store"},
-    "country": {"country", "region", "shipping_country"},
-    "qty": {"quantity", "qty", "units", "item_quantity"},
-    "amount": {"revenue", "sales", "gross_sales", "net_sales", "amount", "total", "line_total", "subtotal", "total_sales"},
-    "price": {"unit_price", "unitprice", "price", "item_price"},
-    "refund": {"refund", "refunds", "return_amount", "refund_amount"},
-    "cogs": {"cogs", "cost", "cost_of_goods", "product_cost"},
-    "shipping": {"shipping", "shipping_cost", "shipping_fees"},
-    "ad_spend": {"ad_spend", "spend", "advertising", "marketing_spend"},
-    "customer": {"customer_id", "customer", "customerid", "buyer_id", "email_hash"},
-    "campaign": {"campaign", "campaign_name", "ad_campaign"},
+    "date": ["date", "day", "order_date", "transaction_date", "created_at", "timestamp"],
+    "order_id": ["order_id", "order", "id", "transaction_id", "trans_id", "invoice_id"],
+    "product": ["product", "item", "product_name", "sku", "title"],
+    "channel": ["channel", "source", "platform", "store", "medium"],
+    "country": ["country", "region", "market", "location"],
+    "qty": ["qty", "quantity", "units", "count"],
+    "amount": ["amount", "sales", "revenue", "net_sales", "total", "gross_sales"],
+    "price": ["price", "unit_price", "rate"],
+    "refund": ["refund", "refunds", "returns", "return_amount"],
+    "cogs": ["cogs", "cost", "unit_cost", "cost_of_goods"],
+    "shipping": ["shipping", "freight", "delivery_fee"],
+    "ad_spend": ["ad_spend", "marketing", "ads", "spend"],
+    "customer": ["customer", "customer_name", "client", "buyer", "email", "customer_id"],
+    "campaign": ["campaign", "utm_campaign", "promo"],
 }
 
-def connect():
-    DB.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB)
+
+def connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(DB_PATH), timeout=30)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA journal_mode=WAL")
-    con.execute("CREATE TABLE IF NOT EXISTS datasets (id INTEGER PRIMARY KEY, name TEXT NOT NULL, currency TEXT NOT NULL, created_at TEXT NOT NULL, records INTEGER NOT NULL, has_cogs INTEGER NOT NULL, fields TEXT NOT NULL, duplicates_removed INTEGER NOT NULL DEFAULT 0)")
-    con.execute("CREATE TABLE IF NOT EXISTS sales (id INTEGER PRIMARY KEY, dataset_id INTEGER NOT NULL, day TEXT NOT NULL, order_id TEXT NOT NULL, product TEXT NOT NULL, channel TEXT NOT NULL, country TEXT NOT NULL, quantity REAL NOT NULL, sales REAL NOT NULL, refund REAL NOT NULL, cogs REAL NOT NULL, shipping REAL NOT NULL, ad_spend REAL NOT NULL, customer_id TEXT NOT NULL, campaign TEXT NOT NULL, FOREIGN KEY(dataset_id) REFERENCES datasets(id))")
-    con.execute("CREATE INDEX IF NOT EXISTS ix_sales_dataset_day ON sales(dataset_id, day)")
-    con.execute("CREATE INDEX IF NOT EXISTS ix_sales_product ON sales(dataset_id, product)")
-    con.execute("CREATE INDEX IF NOT EXISTS ix_sales_channel ON sales(dataset_id, channel)")
-    con.commit()
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS datasets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+            day TEXT,
+            order_id TEXT,
+            product TEXT,
+            channel TEXT,
+            country TEXT,
+            qty REAL DEFAULT 1,
+            amount REAL DEFAULT 0,
+            price REAL DEFAULT 0,
+            refund REAL DEFAULT 0,
+            cogs REAL DEFAULT 0,
+            shipping REAL DEFAULT 0,
+            ad_spend REAL DEFAULT 0,
+            customer TEXT,
+            campaign TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sales_dataset ON sales(dataset_id);
+        """
+    )
     return con
 
-def norm_header(x):
-    return re.sub(r"[^a-z0-9]+", "_", str(x or "").strip().lower()).strip("_")
 
-def parse_date(value):
-    if value is None or str(value).strip() == "": return None
-    if isinstance(value, (datetime, date)): return value.strftime("%Y-%m-%d")
-    s = str(value).strip()
-    try: return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d")
-    except ValueError: pass
-    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%m/%d/%Y %H:%M", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y"):
-        try: return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except ValueError: continue
+def to_float(val) -> float:
+    if val is None or val == "":
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace(",", "").replace("$", "").replace("€", "").replace("£", "")
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def norm_date(val) -> str:
+    if not val:
+        return ""
+    if hasattr(val, "strftime"):
+        return val.strftime("%Y-%m-%d")
+    s = str(val).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return s[:10]
+
+
+def parse_rows(filename: str, raw: bytes) -> list[dict]:
+    ext = Path(filename).suffix.lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        if openpyxl is None:
+            raise ValueError("openpyxl is required to import Excel files.")
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        ws = wb.active
+        matrix = [list(row) for row in ws.iter_rows(values_only=True)]
+        if len(matrix) < 2:
+            return []
+        headers = [str(h or f"col_{i}").strip() for i, h in enumerate(matrix[0])]
+        return [
+            {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+            for row in matrix[1:]
+            if any(c is not None and str(c).strip() != "" for c in row)
+        ]
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    return [dict(r) for r in reader if any(v and str(v).strip() for v in r.values())]
+
+
+def map_column(headers: list[str], target: str) -> str | None:
+    cand = ALIASES.get(target, [target])
+    norm_map = {re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_"): h for h in headers}
+    for c in cand:
+        if c in norm_map:
+            return norm_map[c]
     return None
 
-def number(value):
-    if value is None: return 0.0
-    s = str(value).strip().replace(",", "").replace("$", "").replace("£", "").replace("€", "")
-    if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1]
-    try: return float(s or 0)
-    except ValueError: return 0.0
 
-def decode_file(filename, blob):
-    ext = Path(filename).suffix.lower()
-    if ext == ".csv":
-        text = None
-        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
-            try: text = blob.decode(encoding); break
-            except UnicodeDecodeError: continue
-        reader = csv.reader(StringIO(text or ""))
-        return list(reader)
-    if ext in (".xlsx", ".xlsm"):
-        try:
-            from openpyxl import load_workbook
-        except ImportError as exc:
-            raise ValueError("XLSX support needs openpyxl. Install the app requirements and restart.") from exc
-        wb = load_workbook(BytesIO(blob), read_only=True, data_only=True)
-        ws = wb.active
-        return [list(row) for row in ws.iter_rows(values_only=True)]
-    raise ValueError("Choose a CSV or XLSX file.")
-
-def map_headers(headers):
-    cleaned = [norm_header(x) for x in headers]
-    mapped = {}
-    for field, names in ALIASES.items():
-        for i, name in enumerate(cleaned):
-            if name in names:
-                mapped[field] = i
-                break
-    if "date" not in mapped: raise ValueError("Could not find a date column. Try date, order_date, InvoiceDate, or created_at.")
-    if "amount" not in mapped and "price" not in mapped: raise ValueError("Could not find a sales amount or unit price column.")
-    return mapped, cleaned
-
-def transform(rows):
-    if not rows or len(rows) < 2: raise ValueError("The file needs a header and at least one data row.")
-    mapped, fields = map_headers(rows[0])
-    out = []
-    seen = set()
-    duplicates_removed = 0
-    has_cogs = "cogs" in mapped
-    def get(row, field, fallback=None):
-        i = mapped.get(field)
-        return row[i] if i is not None and i < len(row) else fallback
-    for n, row in enumerate(rows[1:], start=2):
-        if not row or not any(str(v or "").strip() for v in row): continue
-        signature = tuple(str(v or "").strip() for v in row)
-        if signature in seen:
-            duplicates_removed += 1
+def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, str], tuple[str, bytes] | None]:
+    fields: dict[str, str] = {}
+    file_item: tuple[str, bytes] | None = None
+    header_bytes = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+    msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(header_bytes + body)
+    if not msg.is_multipart():
+        return fields, file_item
+    for part in msg.iter_parts():
+        disp = part.get("Content-Disposition", "")
+        name_m = re.search(r'name="([^"]+)"', disp)
+        if not name_m:
             continue
-        seen.add(signature)
-        day = parse_date(get(row, "date"))
-        if not day: continue
-        qty = number(get(row, "qty", 1))
-        amount_raw = get(row, "amount")
-        amount = number(amount_raw) if amount_raw not in (None, "") else qty * number(get(row, "price"))
-        explicit_refund = max(0.0, number(get(row, "refund")))
-        refund = max(explicit_refund, abs(amount) if amount < 0 else 0.0)
-        if qty < 0 and amount > 0 and explicit_refund == 0: refund += amount; amount = 0
-        sales = max(0.0, amount)
-        if sales == 0 and refund == 0: continue
-        order = str(get(row, "order", "") or "").strip()
-        out.append((day, order or f"row-{n}-{uuid.uuid4().hex[:8]}", str(get(row, "product", "Unknown product") or "Unknown product").strip(), str(get(row, "channel", "Unknown") or "Unknown").strip(), str(get(row, "country", "Unknown") or "Unknown").strip(), qty, sales, refund, max(0, number(get(row, "cogs"))), max(0, number(get(row, "shipping"))), max(0, number(get(row, "ad_spend"))), str(get(row, "customer", "") or "").strip(), str(get(row, "campaign", "Unattributed") or "Unattributed").strip()))
-    if not out: raise ValueError("No usable rows found. Include a valid date and a sales amount or unit price.")
-    return out, has_cogs, fields, duplicates_removed
+        field_name = name_m.group(1)
+        fn_m = re.search(r'filename="([^"]*)"', disp)
+        payload = part.get_payload(decode=True) or b""
+        if fn_m:
+            file_item = (fn_m.group(1) or "upload.csv", payload)
+        else:
+            fields[field_name] = payload.decode("utf-8", errors="replace").strip()
+    return fields, file_item
 
-def filters_from(query, dataset_id):
-    args = [dataset_id]
-    where = ["dataset_id=?"]
-    start, end = query.get("from", [""])[0], query.get("to", [""])[0]
-    channel, product = query.get("channel", [""])[0], query.get("product", [""])[0]
-    if start: where.append("day>=?"); args.append(start)
-    if end: where.append("day<=?"); args.append(end)
-    if channel: where.append("channel=?"); args.append(channel)
-    if product: where.append("product=?"); args.append(product)
-    return " AND ".join(where), args
 
-def dataset_list(con):
-    return [dict(r) for r in con.execute("SELECT id,name,currency,created_at,records,has_cogs,fields,duplicates_removed FROM datasets ORDER BY id DESC")]
+class LocalHandler(BaseHTTPRequestHandler):
+    def _json(self, payload: dict, status: int = 200) -> None:
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
-def dashboard(con, dataset_id, query):
-    meta = con.execute("SELECT * FROM datasets WHERE id=?", (dataset_id,)).fetchone()
-    if not meta: return {"datasets": dataset_list(con), "dataset": None, "error": "Upload a CSV or XLSX file to get started."}
-    where, args = filters_from(query, dataset_id)
-    agg = con.execute(f"SELECT SUM(sales) gross, SUM(refund) refunds, SUM(quantity) units, SUM(cogs) cogs, SUM(shipping) shipping, SUM(ad_spend) ad, COUNT(DISTINCT CASE WHEN sales>0 THEN order_id END) orders, COUNT(DISTINCT customer_id) customers FROM sales WHERE {where}", args).fetchone()
-    gross = agg["gross"] or 0; refunds = agg["refunds"] or 0; net = gross-refunds; order_count = agg["orders"] or 0
-    products = [dict(r) for r in con.execute(f"SELECT product,SUM(sales)-SUM(refund) net_sales,SUM(quantity) units,COUNT(DISTINCT CASE WHEN sales>0 THEN order_id END) orders,SUM(refund) refunds,SUM(cogs) cogs,SUM(shipping) shipping,SUM(ad_spend) ad FROM sales WHERE {where} GROUP BY product ORDER BY net_sales DESC", args)]
-    channels = [dict(r) for r in con.execute(f"SELECT channel,SUM(sales)-SUM(refund) net_sales,COUNT(DISTINCT CASE WHEN sales>0 THEN order_id END) orders,SUM(ad_spend) ad FROM sales WHERE {where} GROUP BY channel ORDER BY net_sales DESC", args)]
-    countries = [dict(r) for r in con.execute(f"SELECT country,SUM(sales)-SUM(refund) net_sales FROM sales WHERE {where} GROUP BY country ORDER BY net_sales DESC LIMIT 10", args)]
-    monthly = [dict(r) for r in con.execute(f"SELECT substr(day,1,7) month,SUM(sales)-SUM(refund) net_sales,COUNT(DISTINCT CASE WHEN sales>0 THEN order_id END) orders FROM sales WHERE {where} GROUP BY month ORDER BY month", args)]
-    weekdays = [dict(r) for r in con.execute(f"SELECT strftime('%w',day) weekday,COUNT(DISTINCT CASE WHEN sales>0 THEN order_id END) orders,SUM(sales)-SUM(refund) net_sales FROM sales WHERE {where} GROUP BY weekday ORDER BY weekday", args)]
-    customers = con.execute(f"SELECT COUNT(*) total,SUM(CASE WHEN orders>1 THEN 1 ELSE 0 END) repeat FROM (SELECT customer_id,COUNT(DISTINCT order_id) orders FROM sales WHERE {where} AND sales>0 AND customer_id!='' GROUP BY customer_id)", args).fetchone()
-    customer_total = customers["total"] or 0; repeat = customers["repeat"] or 0
-    rows = con.execute(f"SELECT * FROM sales WHERE {where} ORDER BY day DESC LIMIT 6000", args).fetchall()
-    fields = sorted(set(meta["fields"].split(",")))
-    return {
-        "datasets": dataset_list(con), "dataset": dict(meta), "filters": {"from": query.get("from", [""])[0], "to": query.get("to", [""])[0], "channel": query.get("channel", [""])[0], "product": query.get("product", [""])[0]},
-        "options": {"channels": [r[0] for r in con.execute("SELECT DISTINCT channel FROM sales WHERE dataset_id=? ORDER BY channel", (dataset_id,))], "products": [r[0] for r in con.execute("SELECT DISTINCT product FROM sales WHERE dataset_id=? ORDER BY product", (dataset_id,))]},
-        "metrics": {"gross_sales":gross,"refunds":refunds,"net_sales":net,"orders":order_count,"aov":net/order_count if order_count else 0,"units":agg["units"] or 0,"identified_customers":customer_total,"repeat_customers":repeat,"repeat_pct":repeat/customer_total*100 if customer_total else 0,"estimated_margin":net-(agg["cogs"] or 0)-(agg["shipping"] or 0)-(agg["ad"] or 0),"margin_available":bool(meta["has_cogs"]),"ad_spend":agg["ad"] or 0,"roas":net/(agg["ad"] or 1) if (agg["ad"] or 0)>0 else None},
-        "products":products,"channels":channels,"countries":countries,"monthly":monthly,"weekdays":weekdays,"fields":fields,
-        "rows":[dict(r) for r in rows],"rows_truncated":con.execute(f"SELECT COUNT(*) FROM sales WHERE {where}",args).fetchone()[0]>6000
-    }
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args): print(f"[{self.log_date_time_string()}] {fmt % args}")
-    def send_json(self, data, status=200):
-        body=json.dumps(data, ensure_ascii=False).encode(); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(body)
-    def do_GET(self):
-        parsed=urllib.parse.urlparse(self.path)
-        if parsed.path=="/api/dashboard":
-            query=urllib.parse.parse_qs(parsed.query); con=connect()
-            try:
-                did=int(query.get("dataset",[0])[0])
-                if did==0:
-                    latest=con.execute("SELECT id FROM datasets ORDER BY id DESC LIMIT 1").fetchone(); did=latest[0] if latest else 0
-                self.send_json(dashboard(con,did,query))
-            finally: con.close()
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self._json({"ok": True, "service": "dataprism-local"})
             return
-        if parsed.path=="/api/export":
-            query=urllib.parse.parse_qs(parsed.query); did=int(query.get("dataset",[0])[0]); con=connect()
-            try:
-                where,args=filters_from(query,did); data=con.execute(f"SELECT day,order_id,product,channel,country,quantity,sales,refund,cogs,shipping,ad_spend,customer_id,campaign FROM sales WHERE {where} ORDER BY day",args).fetchall()
-                sio=StringIO(); writer=csv.writer(sio); writer.writerow(["date","order_id","product","channel","country","quantity","sales","refund","cogs","shipping","ad_spend","customer_id","campaign"]); writer.writerows([tuple(r) for r in data]); body=sio.getvalue().encode("utf-8-sig")
-                self.send_response(200); self.send_header("Content-Type","text/csv; charset=utf-8"); self.send_header("Content-Disposition","attachment; filename=dataprism-export.csv"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-            finally: con.close()
+        if parsed.path == "/api/dashboard":
+            qs = parse_qs(parsed.query)
+            rng = qs.get("range", ["all"])[0]
+            with connect() as con:
+                datasets = [dict(r) for r in con.execute("SELECT * FROM datasets ORDER BY id DESC").fetchall()]
+                active = next((d for d in datasets if d["is_active"]), datasets[0] if datasets else None)
+                if not active:
+                    self._json({"datasets": [], "dataset": None, "metrics": {}, "monthly": [], "products": [], "channels": [], "customers": [], "rows": []})
+                    return
+                ds_id = active["id"]
+                where = "WHERE dataset_id = ?"
+                params: list = [ds_id]
+                if rng in ("30", "90"):
+                    max_day_row = con.execute("SELECT MAX(day) AS max_day FROM sales WHERE dataset_id = ?", (ds_id,)).fetchone()
+                    if max_day_row and max_day_row["max_day"]:
+                        try:
+                            cutoff = (datetime.strptime(max_day_row["max_day"], "%Y-%m-%d") - timedelta(days=int(rng))).strftime("%Y-%m-%d")
+                            where += " AND day >= ?"
+                            params.append(cutoff)
+                        except ValueError:
+                            pass
+                m_row = con.execute(
+                    f"SELECT COALESCE(SUM(amount - refund), 0) AS total_sales, COUNT(*) AS order_count, COUNT(DISTINCT customer) AS customers FROM sales {where}",
+                    params,
+                ).fetchone()
+                total_sales = float(m_row["total_sales"] or 0)
+                order_count = int(m_row["order_count"] or 0)
+                aov = total_sales / order_count if order_count else 0.0
+                monthly = [
+                    dict(r)
+                    for r in con.execute(
+                        f"SELECT substr(day, 1, 7) AS month, SUM(amount - refund) AS sales FROM sales {where} AND day != '' GROUP BY substr(day, 1, 7) ORDER BY month",
+                        params,
+                    ).fetchall()
+                ]
+                products = [
+                    dict(r)
+                    for r in con.execute(
+                        f"SELECT COALESCE(NULLIF(product, ''), 'Unknown') AS Product, COUNT(*) AS orders, SUM(amount - refund) AS net_sales FROM sales {where} GROUP BY Product ORDER BY net_sales DESC LIMIT 10",
+                        params,
+                    ).fetchall()
+                ]
+                channels = [
+                    dict(r)
+                    for r in con.execute(
+                        f"SELECT COALESCE(NULLIF(channel, ''), 'Direct') AS Channel, COUNT(*) AS orders, SUM(amount - refund) AS net_sales FROM sales {where} GROUP BY Channel ORDER BY net_sales DESC LIMIT 10",
+                        params,
+                    ).fetchall()
+                ]
+                customers = [
+                    dict(r)
+                    for r in con.execute(
+                        f"SELECT COALESCE(NULLIF(customer, ''), 'Guest') AS Customer, COUNT(*) AS orders, SUM(amount - refund) AS total_spent FROM sales {where} GROUP BY Customer ORDER BY total_spent DESC LIMIT 10",
+                        params,
+                    ).fetchall()
+                ]
+                rows = [
+                    {
+                        "Date": r["day"],
+                        "Order_ID": r["order_id"],
+                        "Channel": r["channel"],
+                        "Product": r["product"],
+                        "Customer": r["customer"],
+                        "Amount": r["amount"] - r["refund"],
+                    }
+                    for r in con.execute(f"SELECT * FROM sales {where} ORDER BY day DESC, id DESC LIMIT 100", params).fetchall()
+                ]
+                self._json(
+                    {
+                        "datasets": datasets,
+                        "dataset": active,
+                        "metrics": {
+                            "total_sales": round(total_sales, 2),
+                            "order_count": order_count,
+                            "aov": round(aov, 2),
+                            "customers": int(m_row["customers"] or 0),
+                        },
+                        "monthly": monthly,
+                        "products": products,
+                        "channels": channels,
+                        "customers": customers,
+                        "rows": rows,
+                    }
+                )
             return
-        path="index.html" if parsed.path=="/" else parsed.path.lstrip("/")
-        target=(ROOT/path).resolve()
-        if ROOT not in target.parents and target!=ROOT: self.send_error(403); return
-        if not target.is_file(): self.send_error(404); return
-        body=target.read_bytes(); typ=mimetypes.guess_type(target.name)[0] or "application/octet-stream"; self.send_response(200); self.send_header("Content-Type",typ+ ("; charset=utf-8" if typ.startswith("text/") else "")); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-    def do_POST(self):
-        request_path=urllib.parse.urlparse(self.path).path
-        if request_path=="/api/load-sample":
-            try:
-                archive=ROOT.parent/"online-retail-uci.zip"
-                if not archive.is_file(): raise ValueError("The included UCI sample archive is missing beside the app folder.")
-                with ZipFile(archive) as zf: blob=zf.read("Online Retail.xlsx")
-                rows=decode_file("Online Retail.xlsx",blob); records,has_cogs,fields,duplicates_removed=transform(rows)
-                con=connect(); cur=con.execute("INSERT INTO datasets(name,currency,created_at,records,has_cogs,fields,duplicates_removed) VALUES(?,?,?,?,?,?,?)",("UCI Online Retail · 2010–2011","GBP",datetime.now().isoformat(timespec="seconds"),len(records),int(has_cogs),",".join(fields),duplicates_removed)); did=cur.lastrowid
-                con.executemany("INSERT INTO sales(dataset_id,day,order_id,product,channel,country,quantity,sales,refund,cogs,shipping,ad_spend,customer_id,campaign) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[(did,*r) for r in records]); con.commit(); con.close()
-                self.send_json({"ok":True,"dataset_id":did,"records":len(records),"duplicates_removed":duplicates_removed,"name":"UCI Online Retail · 2010–2011"})
-            except Exception as exc: self.send_json({"error":str(exc)},400)
+        if parsed.path in ("/", "/index.html"):
+            content = (ROOT / "index.html").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
             return
-        if request_path!="/api/upload": self.send_error(404); return
-        length=int(self.headers.get("Content-Length",0))
-        if length<=0 or length>MAX_UPLOAD: self.send_json({"error":"File is empty or exceeds the 50 MB upload limit."},413); return
-        body=self.rfile.read(length)
-        try:
-            envelope=(f"Content-Type: {self.headers.get('Content-Type')}\r\nMIME-Version: 1.0\r\n\r\n").encode()+body
-            msg=BytesParser(policy=default).parsebytes(envelope)
-            part=next(p for p in msg.iter_parts() if p.get_filename())
-            filename=Path(part.get_filename()).name; blob=part.get_payload(decode=True)
-            currency=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("currency",["USD"])[0]
-            rows=decode_file(filename,blob); records,has_cogs,fields,duplicates_removed=transform(rows)
-            con=connect(); cur=con.execute("INSERT INTO datasets(name,currency,created_at,records,has_cogs,fields,duplicates_removed) VALUES(?,?,?,?,?,?,?)",(filename,currency,datetime.now().isoformat(timespec="seconds"),len(records),int(has_cogs),",".join(fields),duplicates_removed)); did=cur.lastrowid
-            con.executemany("INSERT INTO sales(dataset_id,day,order_id,product,channel,country,quantity,sales,refund,cogs,shipping,ad_spend,customer_id,campaign) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[(did,*r) for r in records]); con.commit(); con.close()
-            self.send_json({"ok":True,"dataset_id":did,"records":len(records),"duplicates_removed":duplicates_removed,"name":filename})
-        except Exception as exc:
-            self.send_json({"error":str(exc)},400)
+        if parsed.path == "/favicon.svg":
+            content = (ROOT / "favicon.svg").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+        self.send_error(404)
 
-if __name__=="__main__":
-    port=int(sys.argv[1]) if len(sys.argv)>1 else 8766
-    connect().close()
-    print(f"DataPrism running at http://127.0.0.1:{port} — uploads are stored locally in {DB}")
-    try: ThreadingHTTPServer(("127.0.0.1",port),Handler).serve_forever()
-    except KeyboardInterrupt: print("\nDataPrism stopped.")
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length > 0 else b""
+        if parsed.path == "/api/active-dataset":
+            data = json.loads(body.decode("utf-8") or "{}")
+            ds_id = int(data.get("id") or 0)
+            with connect() as con:
+                con.execute("UPDATE datasets SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END", (ds_id,))
+            self._json({"ok": True})
+            return
+        if parsed.path == "/api/upload":
+            ctype = self.headers.get("Content-Type", "")
+            try:
+                fields, file_item = parse_multipart_form(ctype, body)
+                if not file_item:
+                    self._json({"ok": False, "error": "No file uploaded."}, 400)
+                    return
+                filename, raw = file_item
+                records = parse_rows(filename, raw)
+                if not records:
+                    self._json({"ok": False, "error": "File has no valid data rows."}, 400)
+                    return
+                headers = list(records[0].keys())
+                col_map = {k: map_column(headers, k) for k in ALIASES}
+                name = fields.get("name") or Path(filename).stem
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                with connect() as con:
+                    con.execute("UPDATE datasets SET is_active = 0")
+                    cur = con.execute(
+                        "INSERT INTO datasets (name, filename, row_count, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
+                        (name, filename, len(records), now),
+                    )
+                    ds_id = cur.lastrowid
+                    batch = []
+                    for idx, r in enumerate(records, start=1):
+                        day = norm_date(r.get(col_map["date"], "")) if col_map["date"] else ""
+                        oid = str(r.get(col_map["order_id"], "") or f"ORD-{idx}") if col_map["order_id"] else f"ORD-{idx}"
+                        prod = str(r.get(col_map["product"], "") or "General") if col_map["product"] else "General"
+                        chan = str(r.get(col_map["channel"], "") or "Direct") if col_map["channel"] else "Direct"
+                        country = str(r.get(col_map["country"], "") or "") if col_map["country"] else ""
+                        qty = to_float(r.get(col_map["qty"], 1)) if col_map["qty"] else 1.0
+                        amt = to_float(r.get(col_map["amount"], 0)) if col_map["amount"] else 0.0
+                        price = to_float(r.get(col_map["price"], amt)) if col_map["price"] else amt
+                        refund = to_float(r.get(col_map["refund"], 0)) if col_map["refund"] else 0.0
+                        cogs = to_float(r.get(col_map["cogs"], 0)) if col_map["cogs"] else 0.0
+                        ship = to_float(r.get(col_map["shipping"], 0)) if col_map["shipping"] else 0.0
+                        ads = to_float(r.get(col_map["ad_spend"], 0)) if col_map["ad_spend"] else 0.0
+                        cust = str(r.get(col_map["customer"], "") or "Guest") if col_map["customer"] else "Guest"
+                        camp = str(r.get(col_map["campaign"], "") or "") if col_map["campaign"] else ""
+                        batch.append((ds_id, day, oid, prod, chan, country, qty, amt, price, refund, cogs, ship, ads, cust, camp))
+                    con.executemany(
+                        """
+                        INSERT INTO sales (dataset_id, day, order_id, product, channel, country, qty, amount, price, refund, cogs, shipping, ad_spend, customer, campaign)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        batch,
+                    )
+                self._json({"ok": True, "dataset_id": ds_id})
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+            return
+        self.send_error(404)
+
+
+def main() -> None:
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", "8780"))
+    host = os.environ.get("DATAPRISM_HOST", "127.0.0.1")
+    srv = HTTPServer((host, port), LocalHandler)
+    print(f"DataPrism local server listening on http://{host}:{port}")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
