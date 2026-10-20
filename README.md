@@ -1,97 +1,132 @@
-# DataPrism — Transparent Data Analytics Platform
+<p align="center">
+  <img src="favicon.svg" width="76" height="76" alt="DataPrism mark">
+</p>
 
-DataPrism is a full-stack portfolio web application for exploring small tabular datasets (`.csv`, `.tsv`, `.xlsx`, `.json`, `.jsonl`). It combines a zero-framework Python HTTP + SQLite backend with a responsive HTML/CSS/SVG/JavaScript frontend designed to make data analysis clear to beginners while reflecting how a careful data analyst works.
+<h1 align="center">DataPrism</h1>
+<p align="center"><strong>Transparent data analytics for everyday datasets.</strong></p>
+<p align="center">Upload a table. Understand its shape. Explore the evidence. Export a clear chart.</p>
 
-Every analysis section and chart explicitly documents:
-- **What the app calculated**
-- **Which columns it used**
-- **How each result was calculated**
-- **What the result may mean**
-- **What assumptions or limitations apply**
+<p align="center">
+  <a href="https://www.python.org/"><img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white"></a>
+  <img alt="Analytics" src="https://img.shields.io/badge/focus-exploratory%20analytics-17694e">
+  <img alt="Deployment" src="https://img.shields.io/badge/deploy-Render-46E3B7?logo=render&logoColor=black">
+</p>
 
-## Repository Architecture
+---
 
-| File | Role |
-| :--- | :--- |
-| `platform_server.py` | Primary multi-user backend server (Python standard library + `sqlite3` + `openpyxl` for `.xlsx`). Handles authentication, session isolation, file parsing, type inference, the 6-section analytics engine, chart validation, and data cleaning snapshots. |
-| `platform.html` | Primary single-page frontend interface for `platform_server.py`, featuring the 6 guided analytics views, interactive Chart Builder (with PNG, SVG, and CSV exports), and Data Preview / Dataset Manager. |
-| `server.py` & `index.html` | Standalone local single-workspace e-commerce prototype (`margimap.sqlite3`). |
-| `Dockerfile` & `compose.yaml` | Container image definition (`python:3.12-slim` on port `8780`) and Docker Compose setup with a named volume for local persistence. |
-| `render.yaml` | Render Blueprint configuration (`plan: free`, Docker runtime, health check at `/api/health`, SQLite path at `/tmp/dataprism/platform.sqlite3`). |
-| `start_dataprism.bat` | One-click Windows launcher that checks Python + `openpyxl`, starts `platform_server.py` on port `8785`, waits for `/api/health`, and opens the browser. |
+DataPrism is a portfolio web application for exploring small tabular datasets. It pairs a guided analytics workspace with a lightweight Python and SQLite backend. Results are designed to be inspectable: the workspace shows the fields used, the calculation performed, and important limits alongside the result.
 
-## Core Analytics Workflow
+> **Demo scope:** DataPrism is intended for learning, demonstrations, and small exploratory datasets. Do not upload confidential, regulated, or otherwise sensitive data.
 
-1. **Dataset Health (`1. Dataset Health`)**
-   - Reports row count, column count, completeness percentage, missing cell counts, and exact full-row duplicates.
-   - Infers column types (`number`, `date`, `category`, `id`, `text`) using a $\ge 75\%$ valid-parse threshold and identifier heuristics (column naming patterns like `_id`/`sku` or near-100% unique codes).
-   - Flags unparseable numeric/date cells and ambiguous slash dates (`MM/DD/YYYY` vs. `DD/MM/YYYY`).
-   - Clearly separates **read-only diagnostic warnings** from **data cleaning actions** (removing duplicates, dropping missing rows, filling numeric blanks with the median, or trimming whitespace), which always create a **new derived dataset copy** so the original upload is never overwritten.
+## What you can do
 
-2. **Numeric Summary (`2. Numeric Summary`)**
-   - Computes valid count, missing count, arithmetic mean, median ($Q_2$), sample standard deviation ($s$), sample variance ($s^2$), minimum, 25th percentile ($Q_1$), 75th percentile ($Q_3$), and maximum for quantitative numeric columns.
-   - Excludes identifier columns (`order_id`, `student_id`, sequential row numbers) from math summaries.
-   - Labels units as `Unknown (not specified)` by default and lets users save custom units (e.g., `USD ($)`, `units`, `%`, `days`).
-   - Explains when extreme outliers pull the mean and variance away from the median and interquartile range ($Q_1\text{–}Q_3$).
+| Workspace | What it helps you explore |
+| --- | --- |
+| **Dataset Health** | Row and column counts, detected field types, missing values, duplicate rows, and import warnings |
+| **Numeric Summary** | Mean, median, sample variance and standard deviation, quartiles, range, and possible outliers |
+| **Category Breakdown** | Counts, shares, and common values for useful categorical fields |
+| **Trends Over Time** | Date-based series with selectable time grain and aggregation |
+| **Relationships** | Numeric scatter plots and optional Pearson correlation |
+| **Category Analysis** | Role-based views for common business and institutional datasets |
+| **Chart Builder** | Bar, line, scatter, donut, and histogram charts with downloadable PNG, SVG, or chart data CSV |
+| **Data Preview** | Search and inspect uploaded rows; create a cleaned copy using supported transformations |
 
-3. **Category Breakdown (`3. Category Breakdown`)**
-   - Shows category counts, percentage of valid (non-missing) rows, percentage of total dataset rows, distinct category count, and most common values.
-   - Suppresses identifier columns from category frequency charts and explains why unique IDs are not meaningful analytical groupings.
+Analysis categories include Sales & E-commerce, Retail & Inventory, Education & Academics, Marketing & Campaigns, Customer Analytics, Finance & Accounting, Product & SaaS, and General / Custom Dataset.
 
-4. **Trends Over Time (`4. Trends Over Time`)**
-   - Enabled only when at least one valid date column exists.
-   - Lets users choose the date column, numeric measure (or row count), time grouping (`Daily`, `Weekly`, `Monthly`, `Quarterly`, `Yearly`), and aggregation (`Sum`, `Average`, `Median`, `Record Count`, `Min`, `Max`).
-   - Explains the exact date normalization (`YYYY-MM-DD`), bucketing rule, and skipped missing rows.
+## See the analysis, not just the number
 
-5. **Relationships (`5. Relationships`)**
-   - Lets users pick any two quantitative numeric columns for a scatter plot and toggle **Pearson correlation ($r$)**.
-   - Validates suitability ($n \ge 3$ paired numeric rows and non-zero variance in both columns) before calculating $r$ and $R^2$.
-   - Prominently explains that **correlation describes linear association and does not prove causation**.
+DataPrism applies practical checks before showing a result:
 
-6. **Category-Specific Analysis (`6. Category Analysis`)**
-   - Suggests domain analyses based on the selected category (**Sales & E-commerce**, **Retail & Inventory**, **Education & Academics**, **Marketing & Campaigns**, **Customer Analytics**, **Finance & Accounting**, **Product & SaaS**, or **General**).
-   - Displays an **editable Column Role Mapping** panel so assumptions are visible and customizable.
-   - Never invents metrics from unrelated columns: for example, Sales profit/margin is calculated only when a `Profit` or `Cost/COGS` column exists; if absent, DataPrism explains which column is missing and provides a general breakdown instead.
+- Numeric and date summaries use fields inferred from the uploaded rows; identifier-like columns are kept out of ordinary metric rankings.
+- Missing and unparseable values are counted and explained. They are not silently changed to zero.
+- Cleaning actions create a derived dataset copy so the uploaded source remains available.
+- Chart choices are checked against field types to help prevent misleading combinations.
+- Category-specific measures are shown only when the required source fields exist.
 
-7. **Validated Chart Builder (`7. Chart Builder`)**
-   - Supports **Bar**, **Line**, **Scatter**, **Donut**, and **Histogram** charts with X-axis, Y-axis (or Row Count), aggregation method, optional Grouping/Color field, and custom titles.
-   - Validates compatibility and blocks misleading combinations (such as scatter plots on text columns, donut charts with negative numbers, or summing an ID column).
-   - Exports charts as **PNG**, **SVG**, or **aggregated CSV data**.
+See [Analytics Methodology](docs/ANALYTICS.md) for calculation details and assumptions.
 
-## Deployment Persistence & Limitations
+## Accepted files
 
-- **Render Free Plan Ephemeral Storage (`render.yaml`)**:
-  The Render Blueprint uses `plan: free` and stores SQLite data at `/tmp/dataprism/platform.sqlite3`. On Render's free tier, container filesystem storage is **temporary (ephemeral)**: saved user accounts and uploaded datasets will disappear whenever the instance sleeps after inactivity, restarts, or redeploys. Both the `/api/health` endpoint and a top banner in the web app surface this notice automatically.
-- **Persistent Local / Docker Storage**:
-  When running locally with Python (`data/platform.sqlite3`) or via `docker compose up` (which mounts the `margimap-data` volume to `/app/data`), your accounts and datasets persist across restarts.
-- **Scale & Security Scope**:
-  DataPrism is designed for small-to-medium exploratory datasets (up to 50 MB / 100,000 rows per upload) processed in Python memory and stored as JSON records in SQLite. Passwords use PBKDF2-HMAC-SHA256 (310,000 iterations) and sessions use `HttpOnly` cookies (`SameSite=Lax`). If deploying over HTTPS in production behind a reverse proxy, consider enabling TLS termination and persistent disk storage.
+CSV, TSV, Excel workbooks in XLSX/XLSM format, JSON arrays or records, and JSON Lines / NDJSON. Uploads are limited by the current server configuration to **50 MB** and **100,000 rows**; larger row sets are truncated at the configured row limit.
 
-## Running Locally
+## Run it locally
 
-### Option 1: Python CLI (macOS, Linux, or Windows)
+### Windows
 
-```bash
-pip install -r requirements.txt
-python platform_server.py 8780
-```
+1. Install Python 3.12.
+2. Open the project folder.
+3. Double-click start_dataprism.bat.
+4. The launcher starts the analytics server and opens http://127.0.0.1:8785.
 
-Then open `http://127.0.0.1:8780` in your browser.
+### Any platform
 
-### Option 2: Windows One-Click Launcher
+From the project directory:
 
-Double-click `start_dataprism.bat` (starts `platform_server.py` on port `8785`, verifies `/api/health`, and opens `http://127.0.0.1:8785`).
+    pip install -r requirements.txt
+    python platform_server.py 8780
 
-### Option 3: Docker Compose (with Persistent Volume)
+Then open http://127.0.0.1:8780. The application and its API are served from the same origin; do not open platform.html directly as a file.
 
-```bash
-docker compose up --build
-```
+### Docker Compose
 
-Then open `http://127.0.0.1:8780`.
+From the project directory:
 
-## Deploying to Render
+    docker compose up --build
 
-1. Push the repository to GitHub.
-2. In the Render Dashboard, click **New +** -> **Blueprint** and connect your `DataPrism` repository.
-3. Render will read `render.yaml`, build the `Dockerfile`, verify `/api/health`, and deploy the web service on the free plan.
+Then open http://127.0.0.1:8780. Compose uses a named volume so the local SQLite database survives container restarts.
+
+## Deploy to Render
+
+This repository includes a Render Blueprint and Dockerfile. In Render, create or connect a Blueprint using this repository and allow Render to read render.yaml. The service builds from Dockerfile and uses /api/health as its health check.
+
+To publish a later change, commit and push it to the branch connected to Render. Automatic deploys are enabled by default for linked repositories; a deploy can also be started from the service’s Deploys page.
+
+**Render free-plan storage is temporary.** The current Blueprint points SQLite at /tmp/dataprism/platform.sqlite3. Accounts and uploaded datasets can be lost when the service sleeps, restarts, or redeploys. This is acceptable for a portfolio demo, but not for durable user data. See [Deployment & Operations](docs/DEPLOYMENT.md).
+
+## How the project is put together
+
+    Browser
+      platform.html  →  same-origin HTTP API
+                            ↓
+      platform_server.py  →  parsing + analytics + validation
+                            ↓
+      SQLite  ←  accounts, sessions, datasets, and derived copies
+
+The frontend is a single HTML file with CSS, SVG, and JavaScript. The backend uses Python’s standard library, SQLite, and openpyxl for Excel parsing. There is no separate JavaScript build step.
+
+| File | Purpose |
+| --- | --- |
+| platform.html | Main DataPrism site and analytics workspace |
+| platform_server.py | Main multi-user application server, API, parsing, and analytics |
+| Dockerfile | Container image used by Render and Docker |
+| render.yaml | Render Blueprint, health check, and environment configuration |
+| compose.yaml | Local Docker setup with persistent named volume |
+| start_dataprism.bat | Windows launcher for the local app |
+| server.py and index.html | Earlier standalone prototype; not the primary Render service |
+| docs/ANALYTICS.md | Definitions, formulas, and interpretation limits |
+| docs/DEPLOYMENT.md | Local, Docker, Render, and troubleshooting notes |
+
+## API landmarks
+
+The browser uses the server’s same-origin API. Useful routes include:
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET | /api/health | Service health and storage status |
+| GET | /api/me | Current account and available categories |
+| GET | /api/dashboard | Dataset overview and guided analyses |
+| GET | /api/preview | Paginated or searched dataset preview |
+| GET | /api/chart | Validated chart data |
+| GET | /api/export | Export a dataset as CSV |
+| POST | /api/auth/signup | Create a demo account |
+| POST | /api/auth/login | Start an account session |
+| POST | /api/upload | Parse and save an uploaded dataset |
+| POST | /api/transform | Create a cleaned dataset copy |
+
+## Project guides
+
+- [Analytics methodology](docs/ANALYTICS.md)
+- [Architecture and API](docs/ARCHITECTURE.md)
+- [Deployment and troubleshooting](docs/DEPLOYMENT.md)
+
+---
